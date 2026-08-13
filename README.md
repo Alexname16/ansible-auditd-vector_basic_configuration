@@ -1,0 +1,1 @@
+# ansible-auditd-vector_basic_configuration
