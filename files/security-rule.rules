@@ -1,0 +1,12 @@
+-D
+-b 8192
+-f 1
+-a always,exit -S execve -F path=/usr/bin/python3 -F auid!=0 -k execve_python
+-a always,exit -F arch=b64 -S execve -k execve
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/sudoers -p wa -k privilege
+-w /etc/sudoers.d/ -p wa -k privilege
+-w /etc/passwd -p wa -F uid!=0 -k not_root-passwd
+-a always,exit -F arch=b64 -S fork -S vfork -S clone -S clone3 -k clone_fork_syscalls
+

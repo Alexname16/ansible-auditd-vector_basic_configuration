@@ -1,0 +1,399 @@
+data_dir: /var/lib/vector
+
+sources:
+  input_file:
+    type: file
+    include:
+      - /var/log/audit/audit.log
+    read_from: beginning
+
+transforms:
+
+  parse_all:
+    type: remap
+    inputs: [input_file]
+    source: |-
+      msg_str = to_string(.message) ?? ""
+
+      m = parse_regex(msg_str, r'^type=(?P<etype>[A-Z0-9_]+)') ?? {}
+      .event_type = m.etype
+      if .event_type == null { .event_type = "unknown" }
+
+      full_match = parse_regex(msg_str, r'audit\((?P<ts>[0-9.]+):(?P<seqno>\d+)\)') ?? {}
+      if full_match != null {
+        .audit_seqno = full_match.seqno
+        ts_float = to_float(full_match.ts) ?? 0.0
+        ts_int = to_int(ts_float)
+        .event_timestamp = from_unix_timestamp(ts_int) ?? now()
+      } else {
+        .audit_seqno = "unknown"
+        .event_timestamp = now()
+      }
+
+      .is_execve_syscall = 0
+      .is_fork_clone_syscall = 0
+      .is_group_end = false
+
+      if .event_type == "SYSCALL" {
+        sc = parse_regex(msg_str, r'syscall=(?P<v>\d+)') ?? {}
+        if sc.v != null {
+          .syscall_num = sc.v
+          if sc.v == "59" { .is_execve_syscall = 1; .syscall_name = "execve" }
+          if sc.v == "57" { .is_fork_clone_syscall = 1; .syscall_name = "fork" }
+          if sc.v == "56" { .is_fork_clone_syscall = 1; .syscall_name = "clone" }
+          if sc.v == "435" { .is_fork_clone_syscall = 1; .syscall_name = "clone3" }
+          if sc.v == "58" { .is_fork_clone_syscall = 1; .syscall_name = "vfork" }
+        }
+        if contains(msg_str, "SYSCALL=execve") { .is_execve_syscall = 1; .syscall_name = "execve" }
+
+        arch_m = parse_regex(msg_str, r'arch=(?P<v>[a-f0-9]+)') ?? {}
+        if arch_m.v != null { .arch = arch_m.v }
+
+        succ_m = parse_regex(msg_str, r'success=(?P<v>\w+)') ?? {}
+        if succ_m.v != null { .success = succ_m.v }
+
+        exit_m = parse_regex(msg_str, r'exit=(?P<v>-?\d+)') ?? {}
+        if exit_m.v != null { .exit_code = exit_m.v }
+
+        pid_m = parse_regex(msg_str, r' pid=(?P<v>\d+)') ?? {}
+        if pid_m.v != null { .pid = pid_m.v }
+
+        ppid_m = parse_regex(msg_str, r'ppid=(?P<v>\d+)') ?? {}
+        if ppid_m.v != null { .ppid = ppid_m.v }
+
+        auid_m = parse_regex(msg_str, r'auid=(?P<v>\d+)') ?? {}
+        if auid_m.v != null { .auid = auid_m.v }
+
+        uid_m = parse_regex(msg_str, r' uid=(?P<v>\d+)') ?? {}
+        if uid_m.v != null { .uid = uid_m.v }
+
+        gid_m = parse_regex(msg_str, r' gid=(?P<v>\d+)') ?? {}
+        if gid_m.v != null { .gid = gid_m.v }
+
+        euid_m = parse_regex(msg_str, r'euid=(?P<v>\d+)') ?? {}
+        if euid_m.v != null { .euid = euid_m.v }
+
+        egid_m = parse_regex(msg_str, r'egid=(?P<v>\d+)') ?? {}
+        if egid_m.v != null { .egid = egid_m.v }
+
+        comm_m = parse_regex(msg_str, r'comm="(?P<v>[^"]*)"') ?? {}
+        if comm_m.v != null { .comm = comm_m.v }
+
+        exe_m = parse_regex(msg_str, r'exe="(?P<v>[^"]*)"') ?? {}
+        if exe_m.v != null { .exe = exe_m.v }
+
+        auid_name_m = parse_regex(msg_str, r'AUID="(?P<v>[^"]*)"') ?? {}
+        if auid_name_m.v != null { .auid_name = auid_name_m.v }
+
+        uid_name_m = parse_regex(msg_str, r'UID="(?P<v>[^"]*)"') ?? {}
+        if uid_name_m.v != null { .uid_name = uid_name_m.v }
+      }
+
+      if .event_type == "EXECVE" {
+        argc_m = parse_regex(msg_str, r'argc=(?P<v>\d+)') ?? {}
+        if argc_m.v != null { .argc = argc_m.v }
+      }
+
+      if .event_type == "CWD" {
+        cwd_m = parse_regex(msg_str, r'cwd="(?P<v>[^"]*)"') ?? {}
+        if cwd_m.v != null { .cwd = cwd_m.v }
+      }
+
+      if .event_type == "PATH" {
+        pn_m = parse_regex(msg_str, r'name="(?P<v>[^"]*)"') ?? {}
+        if pn_m.v != null { .path_name = pn_m.v }
+      }
+
+      if .event_type == "PROCTITLE" {
+        pt_m = parse_regex(msg_str, r'proctitle=(?P<v>[a-fA-F0-9]+)') ?? {}
+        if pt_m.v != null {
+          .proctitle = pt_m.v
+          decoded = decode_base16(pt_m.v) ?? ""
+          .command_line = replace(decoded, r'[\x00-\x1f]', " ")
+        }
+        .is_group_end = true
+      }
+
+      .last_message = msg_str
+
+  event_reduce:
+    type: reduce
+    inputs: [parse_all]
+    group_by: [audit_seqno]
+    ends_when: '.is_group_end == true'
+    expire_after_ms: 3000
+    merge_strategies:
+      event_type: array
+      audit_seqno: retain
+      event_timestamp: retain
+      syscall_num: retain
+      syscall_name: retain
+      arch: retain
+      success: retain
+      exit_code: retain
+      pid: retain
+      ppid: retain
+      auid: retain
+      auid_name: retain
+      uid: retain
+      uid_name: retain
+      gid: retain
+      euid: retain
+      egid: retain
+      comm: retain
+      exe: retain
+      argc: retain
+      cwd: retain
+      path_name: array
+      proctitle: retain
+      command_line: retain
+      is_execve_syscall: sum
+      is_fork_clone_syscall: sum
+      last_message: array
+
+
+  execve_filter:
+    type: remap
+    inputs: [event_reduce]
+    source: |-
+      execve_count = to_int(.is_execve_syscall) ?? 0
+      fork_clone_count = to_int(.is_fork_clone_syscall) ?? 0
+      if execve_count == 0 && fork_clone_count == 0 { abort }
+
+  # Форматирование событий execve
+  format_execve:
+    type: remap
+    inputs: [execve_filter]
+    source: |-
+      . = {
+        "audit_seqno": .audit_seqno,
+        "event_timestamp": .event_timestamp,
+        "syscall": {
+          "num": .syscall_num,
+          "name": .syscall_name,
+          "arch": .arch,
+          "success": .success,
+          "exit": .exit_code
+        },
+        "process": {
+          "pid": .pid,
+          "ppid": .ppid,
+          "comm": .comm,
+          "exe": .exe
+        },
+        "user": {
+          "auid": .auid,
+          "auid_name": .auid_name,
+          "uid": .uid,
+          "uid_name": .uid_name,
+          "gid": .gid,
+          "euid": .euid,
+          "egid": .egid
+        },
+        "execve": {
+          "argc": .argc
+        },
+        "cwd": .cwd,
+        "paths": .path_name,
+        "proctitle": .proctitle,
+        "command_line": .command_line
+      }
+
+ 
+  tag_and_wrap:
+    type: remap
+    inputs: [format_execve]
+    source: |-
+      ts_int = to_unix_timestamp!(.event_timestamp)
+      rem = mod(ts_int, 10)
+      bucket_num = ts_int - rem
+      bucket = to_string(bucket_num)
+      payload = .
+      . = { "window_bucket": bucket, "event": payload }
+
+
+  execve_window:
+    type: reduce
+    inputs: [tag_and_wrap]
+    group_by: [window_bucket]
+    expire_after_ms: 15000
+    merge_strategies:
+      window_bucket: retain
+      event: array
+
+  link_and_merge:
+    type: remap
+    inputs: [execve_window]
+    source: |-
+      events = array!(.event)
+
+   
+      pid_index = {}
+      for_each(events) -> |_i, ev| {
+        p = to_string(ev.process.pid) ?? ""
+        if p != "" {
+          pid_index = set!(pid_index, [p], ev)
+        }
+      }
+
+      linked = []
+      for_each(events) -> |_i, ev| {
+        if ev.syscall.name == "execve" {
+          chain = []
+          found_fork = false
+          cur_ppid = to_string(ev.process.ppid) ?? ""
+
+       
+          if cur_ppid != "" && cur_ppid != "1" {
+            anc1 = get!(pid_index, [cur_ppid])
+            if anc1 != null {
+              is_fork1 = anc1.syscall.name == "fork" || anc1.syscall.name == "clone" || anc1.syscall.name == "vfork" || anc1.syscall.name == "clone3"
+              if is_fork1 {
+                found_fork = true
+                if anc1.cwd == null {
+                  anc1 = set!(anc1, ["cwd"], "forked/cloned")
+                }
+              }
+              chain = push(chain, anc1)
+              cur_ppid = to_string(anc1.process.ppid) ?? ""
+            } else {
+              cur_ppid = ""
+            }
+          }
+
+        
+          if cur_ppid != "" && cur_ppid != "1" {
+            anc2 = get!(pid_index, [cur_ppid])
+            if anc2 != null {
+              is_fork2 = anc2.syscall.name == "fork" || anc2.syscall.name == "clone" || anc2.syscall.name == "vfork" || anc2.syscall.name == "clone3"
+              if is_fork2 {
+                found_fork = true
+                if anc2.cwd == null {
+                  anc2 = set!(anc2, ["cwd"], "forked/cloned")
+                }
+              }
+              chain = push(chain, anc2)
+              cur_ppid = to_string(anc2.process.ppid) ?? ""
+            } else {
+              cur_ppid = ""
+            }
+          }
+
+         
+          if cur_ppid != "" && cur_ppid != "1" {
+            anc3 = get!(pid_index, [cur_ppid])
+            if anc3 != null {
+              is_fork3 = anc3.syscall.name == "fork" || anc3.syscall.name == "clone" || anc3.syscall.name == "vfork" || anc3.syscall.name == "clone3"
+              if is_fork3 {
+                found_fork = true
+                if anc3.cwd == null {
+                  anc3 = set!(anc3, ["cwd"], "forked/cloned")
+                }
+              }
+              chain = push(chain, anc3)
+            }
+          }
+
+          merged = {
+            "audit_seqno": ev.audit_seqno,
+            "event_timestamp": ev.event_timestamp,
+            "syscall": ev.syscall,
+            "process": ev.process,
+            "user": ev.user,
+            "execve": ev.execve,
+            "cwd": ev.cwd,
+            "paths": ev.paths,
+            "proctitle": ev.proctitle,
+            "command_line": ev.command_line,
+            "ancestor_chain": chain,
+            "chain_depth": length(chain),
+            "has_fork_or_clone_ancestor": found_fork
+          }
+          linked = push(linked, merged)
+        }
+      }
+
+      . = { "linked_events": linked }
+
+ 
+  unnest_linked:
+    type: remap
+    inputs: [link_and_merge]
+    source: |-
+      . = unnest!(.linked_events)
+
+  finalize_linked:
+    type: remap
+    inputs: [unnest_linked]
+    source: |-
+      . = .linked_events
+      . = compact!(., recursive: true, null: true, string: false, object: true, array: false)
+
+  non_execve_filter:
+    type: remap
+    inputs: [event_reduce]
+    source: |-
+      execve_count = to_int(.is_execve_syscall) ?? 0
+      fork_clone_count = to_int(.is_fork_clone_syscall) ?? 0
+      if execve_count != 0 || fork_clone_count != 0 { abort }
+
+  format_non_execve:
+    type: remap
+    inputs: [non_execve_filter]
+    source: |-
+      result = {
+        "audit_seqno": .audit_seqno,
+        "event_timestamp": .event_timestamp,
+        "event_types": .event_type,
+        "syscall": {
+          "num": .syscall_num,
+          "name": .syscall_name,
+          "arch": .arch,
+          "success": .success,
+          "exit": .exit_code
+        },
+        "process": {
+          "pid": .pid,
+          "ppid": .ppid,
+          "comm": .comm,
+          "exe": .exe
+        },
+        "user": {
+          "auid": .auid,
+          "auid_name": .auid_name,
+          "uid": .uid,
+          "uid_name": .uid_name,
+          "gid": .gid,
+          "euid": .euid,
+          "egid": .egid
+        },
+        "cwd": .cwd,
+        "messages": .last_message
+      }
+      . = compact(result, recursive: true, null: true, string: false, object: true, array: false)
+
+sinks:
+  debug_link:
+    type: console
+    inputs: [link_and_merge]
+    target: stdout
+    encoding:
+      codec: json
+
+  file_execve:
+    type: file
+    inputs: [finalize_linked]
+    path: /var/log/vector/vector_execve.log
+    encoding: {codec: json}
+
+  file_non_execve:
+    type: file
+    inputs: [format_non_execve]
+    path: /var/log/vector/vector_non_execve.log
+    encoding: {codec: json}
+
+  file_combined:
+    type: file
+    inputs: [finalize_linked, format_non_execve]
+    path: /var/log/vector/vector_combined.log
+    encoding: {codec: json}
