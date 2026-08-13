@@ -160,7 +160,6 @@ transforms:
       fork_clone_count = to_int(.is_fork_clone_syscall) ?? 0
       if execve_count == 0 && fork_clone_count == 0 { abort }
 
-  # Форматирование событий execve
   format_execve:
     type: remap
     inputs: [execve_filter]
