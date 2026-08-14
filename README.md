@@ -1,6 +1,5 @@
 Ansible: Auditd + Vector (Basic Security Configuration)
 
-Сам проект сейчас в ветке dev
 
 Ansible playbook для автоматизации базовых настроек безопасности на **Ubuntu 26.04**.  
 
