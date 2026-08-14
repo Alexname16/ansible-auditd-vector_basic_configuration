@@ -8,7 +8,7 @@ sources:
     read_from: beginning
 
 transforms:
-
+  # 1. Парсинг всех записей (без изменений)
   parse_all:
     type: remap
     inputs: [input_file]
@@ -82,11 +82,14 @@ transforms:
         exe_m = parse_regex(msg_str, r'exe="(?P<v>[^"]*)"') ?? {}
         if exe_m.v != null { .exe = exe_m.v }
 
-        auid_name_m = parse_regex(msg_str, r'AUID="(?P<v>[^"]*)"') ?? {}
+        auid_name_m = parse_regex(msg_str, r'\bAUID="(?P<v>[^"]*)"') ?? {}
         if auid_name_m.v != null { .auid_name = auid_name_m.v }
 
-        uid_name_m = parse_regex(msg_str, r'UID="(?P<v>[^"]*)"') ?? {}
+        uid_name_m = parse_regex(msg_str, r'\bUID="(?P<v>[^"]*)"') ?? {}
         if uid_name_m.v != null { .uid_name = uid_name_m.v }
+
+        gid_name_m = parse_regex(msg_str, r'\bGID="(?P<v>[^"]*)"') ?? {}
+        if gid_name_m.v != null { .gid_name = gid_name_m.v }
       }
 
       if .event_type == "EXECVE" {
@@ -116,6 +119,7 @@ transforms:
 
       .last_message = msg_str
 
+  # 2. Группировка записей одного события (без изменений)
   event_reduce:
     type: reduce
     inputs: [parse_all]
@@ -138,6 +142,7 @@ transforms:
       uid: retain
       uid_name: retain
       gid: retain
+      gid_name: retain
       euid: retain
       egid: retain
       comm: retain
@@ -151,15 +156,36 @@ transforms:
       is_fork_clone_syscall: sum
       last_message: array
 
-
-  execve_filter:
+  # 3. Отбрасываем события firmware-updater/firmware-notifier до разделения на ветки.
+  #    Проверяем не только comm/exe, но и cwd/command_line/paths - иначе
+  #    вспомогательные процессы snapd (snap-confine, getent, apparmor_parser
+  #    и т.п.) проходят фильтр, хотя явно относятся к firmware-updater.
+  #    Строка сужена до "firmware-updater" (не просто "firmware"), чтобы
+  #    не задеть легитимные события вроде cat /lib/firmware/intel-ucode/...
+  drop_firmware:
     type: remap
     inputs: [event_reduce]
+    source: |-
+      exe_val = to_string(.exe) ?? ""
+      comm_val = to_string(.comm) ?? ""
+      cwd_val = to_string(.cwd) ?? ""
+      cmd_val = to_string(.command_line) ?? ""
+      paths_val = join(.path_name, " ") ?? ""
+      haystack = exe_val + " " + comm_val + " " + cwd_val + " " + cmd_val + " " + paths_val
+      if contains(haystack, "firmware-updater") {
+        abort
+      }
+
+  # 4. Фильтр: только execve/fork/clone события
+  execve_filter:
+    type: remap
+    inputs: [drop_firmware]
     source: |-
       execve_count = to_int(.is_execve_syscall) ?? 0
       fork_clone_count = to_int(.is_fork_clone_syscall) ?? 0
       if execve_count == 0 && fork_clone_count == 0 { abort }
 
+  # 4. Форматирование одиночного события (execve ИЛИ fork/clone)
   format_execve:
     type: remap
     inputs: [execve_filter]
@@ -186,8 +212,7 @@ transforms:
           "uid": .uid,
           "uid_name": .uid_name,
           "gid": .gid,
-          "euid": .euid,
-          "egid": .egid
+          "gid_name": .gid_name
         },
         "execve": {
           "argc": .argc
@@ -198,7 +223,10 @@ transforms:
         "command_line": .command_line
       }
 
- 
+  # 5. Простановка "бакета" времени (10-секундное псевдо-окно).
+  #    aggregate-трансформ здесь не подходит: он принимает только метрики,
+  #    логи он молча отбрасывает - поэтому окно делаем через reduce,
+  #    группируя по вычисляемому ключу времени.
   tag_and_wrap:
     type: remap
     inputs: [format_execve]
@@ -210,7 +238,10 @@ transforms:
       payload = .
       . = { "window_bucket": bucket, "event": payload }
 
-
+  # 6. Буфер: собираем все execve/fork/clone события 10-секундного окна в массив.
+  #    expire_after_ms задан больше ширины окна (10с), чтобы группа с "прошлым"
+  #    значением bucket гарантированно закрылась по простою, как только
+  #    время перешло в следующий бакет.
   execve_window:
     type: reduce
     inputs: [tag_and_wrap]
@@ -220,18 +251,36 @@ transforms:
       window_bucket: retain
       event: array
 
+  # 7. Связывание: для каждого execve ищем цепочку предков (fork/clone/execve)
+  #    по ppid на глубину до 3 "хопов" назад и склеиваем их в одно событие.
   link_and_merge:
     type: remap
     inputs: [execve_window]
     source: |-
       events = array!(.event)
 
-   
+      # Два индекса на pid:
+      # - pid_index: последнее ЛЮБОЕ событие на pid - основной источник
+      #   связи по pid/ppid (в цепочку попадает предок любого типа, даже
+      #   если fork/clone для него в audit.log вообще не было записано -
+      #   так родство всё равно виднее, чем никак).
+      # - pid_fork_index: последнее именно fork/clone-событие на pid,
+      #   отдельно от pid_index - нужен только чтобы понять, БЫЛ ли у
+      #   этого pid реальный fork/clone-вызов в окне, и проставить
+      #   is_fork_or_clone на конкретном хопе / found_fork на событии.
+      #   "last write wins" в pid_index больше не мешает этому флагу,
+      #   т.к. это отдельная структура, которую execve того же pid не
+      #   перезаписывает.
       pid_index = {}
+      pid_fork_index = {}
       for_each(events) -> |_i, ev| {
         p = to_string(ev.process.pid) ?? ""
         if p != "" {
           pid_index = set!(pid_index, [p], ev)
+          is_fork_ev = ev.syscall.name == "fork" || ev.syscall.name == "clone" || ev.syscall.name == "vfork" || ev.syscall.name == "clone3"
+          if is_fork_ev {
+            pid_fork_index = set!(pid_fork_index, [p], ev)
+          }
         }
       }
 
@@ -242,17 +291,19 @@ transforms:
           found_fork = false
           cur_ppid = to_string(ev.process.ppid) ?? ""
 
-       
+          # hop 1
           if cur_ppid != "" && cur_ppid != "1" {
-            anc1 = get!(pid_index, [cur_ppid])
+            anc1_any = get!(pid_index, [cur_ppid])
+            anc1_fork = get!(pid_fork_index, [cur_ppid])
+            is_fork1 = anc1_fork != null
+            anc1 = anc1_any
+            if anc1 == null { anc1 = anc1_fork }
             if anc1 != null {
-              is_fork1 = anc1.syscall.name == "fork" || anc1.syscall.name == "clone" || anc1.syscall.name == "vfork" || anc1.syscall.name == "clone3"
-              if is_fork1 {
-                found_fork = true
-                if anc1.cwd == null {
-                  anc1 = set!(anc1, ["cwd"], "forked/cloned")
-                }
+              if is_fork1 { found_fork = true }
+              if anc1.cwd == null {
+                anc1 = set!(anc1, ["cwd"], "forked/cloned")
               }
+              anc1 = set!(anc1, ["is_fork_or_clone"], is_fork1)
               chain = push(chain, anc1)
               cur_ppid = to_string(anc1.process.ppid) ?? ""
             } else {
@@ -260,17 +311,19 @@ transforms:
             }
           }
 
-        
+          # hop 2
           if cur_ppid != "" && cur_ppid != "1" {
-            anc2 = get!(pid_index, [cur_ppid])
+            anc2_any = get!(pid_index, [cur_ppid])
+            anc2_fork = get!(pid_fork_index, [cur_ppid])
+            is_fork2 = anc2_fork != null
+            anc2 = anc2_any
+            if anc2 == null { anc2 = anc2_fork }
             if anc2 != null {
-              is_fork2 = anc2.syscall.name == "fork" || anc2.syscall.name == "clone" || anc2.syscall.name == "vfork" || anc2.syscall.name == "clone3"
-              if is_fork2 {
-                found_fork = true
-                if anc2.cwd == null {
-                  anc2 = set!(anc2, ["cwd"], "forked/cloned")
-                }
+              if is_fork2 { found_fork = true }
+              if anc2.cwd == null {
+                anc2 = set!(anc2, ["cwd"], "forked/cloned")
               }
+              anc2 = set!(anc2, ["is_fork_or_clone"], is_fork2)
               chain = push(chain, anc2)
               cur_ppid = to_string(anc2.process.ppid) ?? ""
             } else {
@@ -278,17 +331,19 @@ transforms:
             }
           }
 
-         
+          # hop 3
           if cur_ppid != "" && cur_ppid != "1" {
-            anc3 = get!(pid_index, [cur_ppid])
+            anc3_any = get!(pid_index, [cur_ppid])
+            anc3_fork = get!(pid_fork_index, [cur_ppid])
+            is_fork3 = anc3_fork != null
+            anc3 = anc3_any
+            if anc3 == null { anc3 = anc3_fork }
             if anc3 != null {
-              is_fork3 = anc3.syscall.name == "fork" || anc3.syscall.name == "clone" || anc3.syscall.name == "vfork" || anc3.syscall.name == "clone3"
-              if is_fork3 {
-                found_fork = true
-                if anc3.cwd == null {
-                  anc3 = set!(anc3, ["cwd"], "forked/cloned")
-                }
+              if is_fork3 { found_fork = true }
+              if anc3.cwd == null {
+                anc3 = set!(anc3, ["cwd"], "forked/cloned")
               }
+              anc3 = set!(anc3, ["is_fork_or_clone"], is_fork3)
               chain = push(chain, anc3)
             }
           }
@@ -314,7 +369,7 @@ transforms:
 
       . = { "linked_events": linked }
 
- 
+  # 8. "Разворачиваем" массив линкованных событий обратно в отдельные события потока
   unnest_linked:
     type: remap
     inputs: [link_and_merge]
@@ -328,9 +383,10 @@ transforms:
       . = .linked_events
       . = compact!(., recursive: true, null: true, string: false, object: true, array: false)
 
+  # 9. Не-execve события (без изменений)
   non_execve_filter:
     type: remap
-    inputs: [event_reduce]
+    inputs: [drop_firmware]
     source: |-
       execve_count = to_int(.is_execve_syscall) ?? 0
       fork_clone_count = to_int(.is_fork_clone_syscall) ?? 0
@@ -363,8 +419,7 @@ transforms:
           "uid": .uid,
           "uid_name": .uid_name,
           "gid": .gid,
-          "euid": .euid,
-          "egid": .egid
+          "gid_name": .gid_name
         },
         "cwd": .cwd,
         "messages": .last_message
@@ -372,6 +427,8 @@ transforms:
       . = compact(result, recursive: true, null: true, string: false, object: true, array: false)
 
 sinks:
+  # Временный отладочный sink - удобно на этапе отладки, но перед сдачей
+  # задания рекомендуется закомментировать/удалить.
   debug_link:
     type: console
     inputs: [link_and_merge]
@@ -379,6 +436,7 @@ sinks:
     encoding:
       codec: json
 
+  # Итоговые склеенные execve-события (execve + до 3 предков fork/clone/execve)
   file_execve:
     type: file
     inputs: [finalize_linked]
@@ -391,8 +449,10 @@ sinks:
     path: /var/log/vector/vector_non_execve.log
     encoding: {codec: json}
 
+  # Третий sink: объединённый поток execve + non-execve событий в один файл
   file_combined:
     type: file
     inputs: [finalize_linked, format_non_execve]
     path: /var/log/vector/vector_combined.log
     encoding: {codec: json}
+
