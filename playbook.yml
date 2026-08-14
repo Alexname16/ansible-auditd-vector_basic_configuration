@@ -1,0 +1,187 @@
+---
+- name: Security playbook
+  hosts: hosts
+  become: yes
+
+  vars:
+    username: user
+    ssh_port: 2223
+    audit_rules_file: /etc/audit/rules.d/security-rule.rules
+
+  handlers:
+  
+    - name: Restart vector
+      ansible.builtin.service:
+        name: vector
+        state: restarted
+  
+    - name: Enabled fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: started
+        enabled: yes
+
+    - name: Restart ssh
+      ansible.builtin.shell: |
+        sudo systemctl disable --now ssh.socket
+        sudo systemctl enable --now ssh.service
+        sudo systemctl restart ssh.service
+
+    - name: Restart fail2ban
+      ansible.builtin.service:
+        name: fail2ban
+        state: restarted
+
+    - name: Status auditd
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: yes
+
+    - name: Restart rsyslog
+      ansible.builtin.service:
+        name: rsyslog
+        state: restarted
+
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install security packages
+      ansible.builtin.apt:
+        name:
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+        state: present
+
+    - name: Allow ports for ufw
+      ansible.builtin.shell: |
+        ufw allow 22/tcp
+        ufw allow {{ ssh_port }}/tcp
+
+    - name: Configuring ufw
+      ansible.builtin.shell: |
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw --force enable
+      changed_when: false
+
+    - name: Configuring fail2ban
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 1h
+          findtime = 10m
+          maxretry = 3
+
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+        mode: '0644'
+      notify:
+        - Restart fail2ban
+        - Enabled fail2ban
+
+    - name: Configuring ssh
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^#?Port', line: 'Port {{ ssh_port }}' }
+        - { regexp: '^#?PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^#?PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^#?AllowTcpForwarding', line: 'AllowTcpForwarding no' }
+        - { regexp: '^#?MaxAuthTries', line: 'MaxAuthTries 3' }
+      notify:
+        - Restart ssh
+
+    - name: Install auditd package
+      ansible.builtin.apt:
+        name:
+          - auditd
+        state: present
+        update_cache: false
+        cache_valid_time: 3600
+
+    - name: Ensure audit log directory exists
+      ansible.builtin.file:
+        path: /var/log/audit
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      notify: Status auditd
+
+    - name: Configure auditd
+      ansible.builtin.copy:
+        src: auditd.conf
+        dest: /etc/audit/auditd.conf
+        owner: root
+        group: root
+        mode: "0640"
+      changed_when: true 
+      
+
+    - name: Deploy audit rules for EXECVE and security events
+      ansible.builtin.copy:
+        src: security-rule.rules
+        dest: "{{ audit_rules_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Load audit rules into kernel
+      ansible.builtin.command: augenrules --load
+      failed_when: false
+      
+    - name: Restart auditd
+      ansible.builtin.service:
+        name: auditd
+        state: restarted
+        enabled: yes
+
+    - name: Copying Vector
+      ansible.builtin.copy:
+        src: vector_0.57.0-1_amd64.deb
+        dest: /tmp/
+
+    - name: Installation Vector
+      ansible.builtin.apt:
+        deb: /tmp/vector_0.57.0-1_amd64.deb
+        state: present
+        
+    - name: Configuring Vector
+      ansible.builtin.copy:
+        src: vector.yaml
+        dest: /etc/vector/vector.yaml
+        
+    - name: Ensure Vector log directory exists
+      ansible.builtin.file:
+        path: /var/log/vector
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"	    
+        
+    - name: Change ACL for Vector
+      ansible.builtin.shell: |
+        chmod 644 /var
+        chmod 644 /var/log
+        chmod 644 /var/log/audit
+        chmod 644 /var/log/vector
+        chown vector:vector /var/log/vector
+        chmod 644 /var/log/audit/audit.log
+              
+    - name: Checkout vector service
+      ansible.builtin.service:
+        name: vector
+        state: started
+        enabled: yes
+    
