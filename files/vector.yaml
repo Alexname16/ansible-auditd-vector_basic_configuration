@@ -8,7 +8,7 @@ sources:
     read_from: beginning
 
 transforms:
-  # 1. Парсинг всех записей (без изменений)
+ 
   parse_all:
     type: remap
     inputs: [input_file]
@@ -119,7 +119,7 @@ transforms:
 
       .last_message = msg_str
 
-  # 2. Группировка записей одного события (без изменений)
+
   event_reduce:
     type: reduce
     inputs: [parse_all]
@@ -156,12 +156,7 @@ transforms:
       is_fork_clone_syscall: sum
       last_message: array
 
-  # 3. Отбрасываем события firmware-updater/firmware-notifier до разделения на ветки.
-  #    Проверяем не только comm/exe, но и cwd/command_line/paths - иначе
-  #    вспомогательные процессы snapd (snap-confine, getent, apparmor_parser
-  #    и т.п.) проходят фильтр, хотя явно относятся к firmware-updater.
-  #    Строка сужена до "firmware-updater" (не просто "firmware"), чтобы
-  #    не задеть легитимные события вроде cat /lib/firmware/intel-ucode/...
+
   drop_firmware:
     type: remap
     inputs: [event_reduce]
@@ -176,7 +171,7 @@ transforms:
         abort
       }
 
-  # 4. Фильтр: только execve/fork/clone события
+
   execve_filter:
     type: remap
     inputs: [drop_firmware]
@@ -185,7 +180,7 @@ transforms:
       fork_clone_count = to_int(.is_fork_clone_syscall) ?? 0
       if execve_count == 0 && fork_clone_count == 0 { abort }
 
-  # 4. Форматирование одиночного события (execve ИЛИ fork/clone)
+
   format_execve:
     type: remap
     inputs: [execve_filter]
@@ -223,10 +218,7 @@ transforms:
         "command_line": .command_line
       }
 
-  # 5. Простановка "бакета" времени (10-секундное псевдо-окно).
-  #    aggregate-трансформ здесь не подходит: он принимает только метрики,
-  #    логи он молча отбрасывает - поэтому окно делаем через reduce,
-  #    группируя по вычисляемому ключу времени.
+
   tag_and_wrap:
     type: remap
     inputs: [format_execve]
@@ -238,10 +230,7 @@ transforms:
       payload = .
       . = { "window_bucket": bucket, "event": payload }
 
-  # 6. Буфер: собираем все execve/fork/clone события 10-секундного окна в массив.
-  #    expire_after_ms задан больше ширины окна (10с), чтобы группа с "прошлым"
-  #    значением bucket гарантированно закрылась по простою, как только
-  #    время перешло в следующий бакет.
+
   execve_window:
     type: reduce
     inputs: [tag_and_wrap]
@@ -251,26 +240,14 @@ transforms:
       window_bucket: retain
       event: array
 
-  # 7. Связывание: для каждого execve ищем цепочку предков (fork/clone/execve)
-  #    по ppid на глубину до 3 "хопов" назад и склеиваем их в одно событие.
+
   link_and_merge:
     type: remap
     inputs: [execve_window]
     source: |-
       events = array!(.event)
 
-      # Два индекса на pid:
-      # - pid_index: последнее ЛЮБОЕ событие на pid - основной источник
-      #   связи по pid/ppid (в цепочку попадает предок любого типа, даже
-      #   если fork/clone для него в audit.log вообще не было записано -
-      #   так родство всё равно виднее, чем никак).
-      # - pid_fork_index: последнее именно fork/clone-событие на pid,
-      #   отдельно от pid_index - нужен только чтобы понять, БЫЛ ли у
-      #   этого pid реальный fork/clone-вызов в окне, и проставить
-      #   is_fork_or_clone на конкретном хопе / found_fork на событии.
-      #   "last write wins" в pid_index больше не мешает этому флагу,
-      #   т.к. это отдельная структура, которую execve того же pid не
-      #   перезаписывает.
+   
       pid_index = {}
       pid_fork_index = {}
       for_each(events) -> |_i, ev| {
@@ -291,7 +268,7 @@ transforms:
           found_fork = false
           cur_ppid = to_string(ev.process.ppid) ?? ""
 
-          # hop 1
+        
           if cur_ppid != "" && cur_ppid != "1" {
             anc1_any = get!(pid_index, [cur_ppid])
             anc1_fork = get!(pid_fork_index, [cur_ppid])
@@ -311,7 +288,7 @@ transforms:
             }
           }
 
-          # hop 2
+       
           if cur_ppid != "" && cur_ppid != "1" {
             anc2_any = get!(pid_index, [cur_ppid])
             anc2_fork = get!(pid_fork_index, [cur_ppid])
@@ -331,7 +308,7 @@ transforms:
             }
           }
 
-          # hop 3
+       
           if cur_ppid != "" && cur_ppid != "1" {
             anc3_any = get!(pid_index, [cur_ppid])
             anc3_fork = get!(pid_fork_index, [cur_ppid])
@@ -369,7 +346,7 @@ transforms:
 
       . = { "linked_events": linked }
 
-  # 8. "Разворачиваем" массив линкованных событий обратно в отдельные события потока
+ 
   unnest_linked:
     type: remap
     inputs: [link_and_merge]
@@ -383,7 +360,7 @@ transforms:
       . = .linked_events
       . = compact!(., recursive: true, null: true, string: false, object: true, array: false)
 
-  # 9. Не-execve события (без изменений)
+
   non_execve_filter:
     type: remap
     inputs: [drop_firmware]
@@ -427,8 +404,7 @@ transforms:
       . = compact(result, recursive: true, null: true, string: false, object: true, array: false)
 
 sinks:
-  # Временный отладочный sink - удобно на этапе отладки, но перед сдачей
-  # задания рекомендуется закомментировать/удалить.
+ 
   debug_link:
     type: console
     inputs: [link_and_merge]
@@ -436,7 +412,7 @@ sinks:
     encoding:
       codec: json
 
-  # Итоговые склеенные execve-события (execve + до 3 предков fork/clone/execve)
+
   file_execve:
     type: file
     inputs: [finalize_linked]
@@ -449,7 +425,6 @@ sinks:
     path: /var/log/vector/vector_non_execve.log
     encoding: {codec: json}
 
-  # Третий sink: объединённый поток execve + non-execve событий в один файл
   file_combined:
     type: file
     inputs: [finalize_linked, format_non_execve]
